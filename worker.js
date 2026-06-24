@@ -813,7 +813,12 @@ function initializePlyr(options = {}) {
     const defaultOptions = {
         controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'settings', 'pip', 'fullscreen'],
         settings: ['quality', 'speed'],
-        keyboard: { focused: true, global: true }
+        keyboard: { focused: true, global: true },
+        i18n: {
+            qualityLabel: {
+                0: 'Auto'
+            }
+        }
     };
     
     const mergedOptions = Object.assign({}, defaultOptions, options);
@@ -899,7 +904,7 @@ function renderCategories() {
         <div class="cat-avatar w-8 h-8 rounded-full \${colorClass} flex items-center justify-center text-white text-xs font-bold shrink-0 shadow-inner">\${initial}</div>
         <div class="cat-text-container flex flex-col overflow-hidden">
             <span class="text-sm font-medium text-white truncate">\${displayGroupName}</span>
-            <span class="text-[11px] text-gray-500 mt-0.5">\${groupChannels.length} Channels</span>
+            <span class="text-[11px] text-gray-500 mt-0.5">\text{\${groupChannels.length}} Channels</span>
         </div>
         \`;
         
@@ -964,7 +969,7 @@ function renderChannels(channelsArray) {
             const safeLogoUrl = ch.logo ? '?action=logo&url=' + encodeURIComponent(ch.logo) : '';
             const logoHtml = ch.logo
                 ? \`<img src="\${safeLogoUrl}" loading="lazy" class="w-full h-full object-contain" onerror="this.outerHTML='<span class=\\'text-xs font-bold\\'>\${ch.name.charAt(0)}</span>'"/>\`
-                : \`<span class="text-xs font-bold text-gray-400">\${ch.name.charAt(0)}</span>\`;
+                : \`<span class="text-xs font-bold text-gray-400">\text{\${ch.name.charAt(0)}}</span>\`;
             
             const isFav = getFavorites().includes(ch.id);
             const starColor = isFav ? "text-[#E87A31]" : "text-gray-600 hover:text-[#E87A31]";
@@ -1062,40 +1067,55 @@ function playStream(url) {
     if (Hls.isSupported()) {
         if (hls) hls.destroy();
         
+        let initialEstimate = 120000; // 120kbps very light default
+        let maxBufferLength = 120;
+        let syncDuration = 15;
+
+        // Auto detect slow/unstable network types using browser Connection API
+        if (navigator.connection) {
+            const conn = navigator.connection;
+            if (conn.effectiveType === '2g' || conn.effectiveType === '3g' || conn.saveData || (conn.downlink && conn.downlink < 0.8)) {
+                initialEstimate = 70000; // 70kbps starting point (practically audio bandwidth requirements)
+                maxBufferLength = 180;   // Buffer up to 3 minutes
+                syncDuration = 20;       // Buffer 20 segments behind live edge to survive network drops
+            }
+        }
+        
         // Deep buffer, error-resilient settings optimized for low-speed and unstable connections
         hls = new Hls({
             enableWorker: true,
             lowLatencyMode: false,
+            progressive: true,               // Progressive fragment appending (starts feeding MSE immediately as bytes arrive)
             backBufferLength: 90,             // Retain loaded frames in back buffer
-            maxBufferLength: 120,            // Buffer heavily forward (up to 2 minutes)
+            maxBufferLength: maxBufferLength, 
             maxMaxBufferLength: 300,         // Absolute maximum forward cache limit (5 minutes)
-            maxBufferSize: 150 * 1024 * 1024,// Maximum buffer memory size (150MB)
+            maxBufferSize: 120 * 1024 * 1024,// Maximum buffer memory size (120MB)
             
             // Build a massive cushion behind the live edge to prevent stuttering/dropouts
-            liveSyncDurationCount: 15,       // Start playback only when 15 segments are cached in buffer
-            liveMaxLatencyDurationCount: 22,
+            liveSyncDurationCount: syncDuration,       
+            liveMaxLatencyDurationCount: syncDuration + 8,
             
-            // Start very conservatively to prevent startup stalls
-            abrEwmaDefaultEstimate: 150000,  // Assume slow speed (150kbps) on stream initialization
-            abrBandwidthFactor: 0.6,         // Scale down bandwidth estimation to be safe
-            abrBandwidthUpFactor: 0.4,       // Restrict easy switching to higher bitrates
+            // Adaptive Bitrate conservative setup
+            abrEwmaDefaultEstimate: initialEstimate,  
+            abrBandwidthFactor: 0.5,         // Scale down bandwidth estimation heavily to prevent buffer starvation
+            abrBandwidthUpFactor: 0.3,       // Make it extremely hard to switch to higher bitrates unnecessarily
             
             // Extended timeouts and heavy retry counts for low-speed network recovery
-            fragLoadingTimeOut: 30000,
-            manifestLoadingTimeOut: 30000,
-            levelLoadingTimeOut: 30000,
-            fragLoadingMaxRetry: 15,
-            manifestLoadingMaxRetry: 15,
-            levelLoadingMaxRetry: 15,
-            fragLoadingRetryDelay: 1500,
-            manifestLoadingRetryDelay: 1500,
-            levelLoadingRetryDelay: 1500
+            fragLoadingTimeOut: 35000,
+            manifestLoadingTimeOut: 35000,
+            levelLoadingTimeOut: 35000,
+            fragLoadingMaxRetry: 20,
+            manifestLoadingMaxRetry: 20,
+            levelLoadingMaxRetry: 20,
+            fragLoadingRetryDelay: 2000,
+            manifestLoadingRetryDelay: 2000,
+            levelLoadingRetryDelay: 2000
         });
         
         hls.loadSource(url); 
         hls.attachMedia(nativeVideo);
         
-        // Automatic Error Management to keep stream playing on network drops
+        // Error Recovery Listeners to keep stream alive during drops
         hls.on(Hls.Events.ERROR, function (event, data) {
             if (data.fatal) {
                 switch (data.type) {
@@ -1108,7 +1128,7 @@ function playStream(url) {
                         hls.recoverMediaError();
                         break;
                     default:
-                        console.error("Fatal error. Auto-reloading source in 3 seconds...");
+                        console.error("Unrecoverable error. Reloading source in 3s...");
                         setTimeout(() => playStream(url), 3000);
                         break;
                 }
@@ -1116,36 +1136,105 @@ function playStream(url) {
         });
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            // Retrieve available stream qualities (heights)
             const availableQualities = hls.levels.map(l => l.height).filter(h => h);
-            const uniqueQualities = [...new Set(availableQualities)].sort((a, b) => b - a);
             
+            // Deduplicate and sort qualities from highest to lowest
+            let uniqueQualities = [...new Set(availableQualities)].sort((a, b) => b - a);
+            
+            let isWeakConnection = false;
+            let maxCappedHeight = 360; // Max default cap on weak connections
+
+            if (navigator.connection) {
+                const conn = navigator.connection;
+                if (conn.effectiveType === '2g' || conn.effectiveType === '3g' || conn.saveData || (conn.downlink && conn.downlink < 0.8)) {
+                    isWeakConnection = true;
+                    maxCappedHeight = 240; // Force maximum quality cap to 240p on highly weak connections to ensure zero-cut
+                }
+            }
+
             const plyrOptions = {};
             if (uniqueQualities.length > 0) {
-                uniqueQualities.unshift(0); // 0 acts as "Auto"
+                // If network connection is weak, limit qualities to capped height (dynamic cap)
+                if (isWeakConnection || maxCappedHeight === 240) {
+                    console.log("Weak connection detected. Capping max HLS level to " + maxCappedHeight + "p.");
+                    const cappedLevels = hls.levels.filter(l => l.height && l.height <= maxCappedHeight);
+                    if (cappedLevels.length > 0) {
+                        const maxLevelHeight = Math.max(...cappedLevels.map(l => l.height));
+                        const maxLevelIndex = hls.levels.findIndex(l => l.height === maxLevelHeight);
+                        hls.maxSupportedLevel = maxLevelIndex; // Hard cap HLS auto level
+                        uniqueQualities = uniqueQualities.filter(q => q <= maxCappedHeight); // Cap user settings list
+                    }
+                }
+
+                // Add Auto (0) to the beginning of the list
+                uniqueQualities.unshift(0);
                 
                 plyrOptions.quality = {
-                    default: 0,
+                    default: 0, // Default to Auto
                     options: uniqueQualities,
-                    forced: true,
+                    forced: true, // Prevents Plyr from rewriting standard source URLs
                     onChange: (quality) => {
                         if (quality === 0) {
-                            hls.currentLevel = -1; // -1 represents adaptive quality in Hls.js
+                            hls.currentLevel = -1; // -1 triggers HLS.js adaptive auto bitrate selection
                         } else {
                             const levelIndex = hls.levels.findIndex(l => l.height === quality);
                             if (levelIndex !== -1) {
-                                hls.currentLevel = levelIndex; // Forces instant quality switch
+                                hls.currentLevel = levelIndex; // Forces instantaneous switch to the manual level
                             }
                         }
                     }
                 };
             }
             
+            // LEVEL_SWITCHED listener to update "Auto (360p)" text inside settings menu dynamically (removes ugly "0p")
+            hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+                const span = document.querySelector(".plyr__menu__container [data-plyr='quality'][value='0'] span");
+                if (span) {
+                    if (hls.autoLevelEnabled && hls.levels[data.level]) {
+                        const height = hls.levels[data.level].height;
+                        span.innerHTML = height ? "Auto (" + height + "p)" : "Auto";
+                    } else {
+                        span.innerHTML = "Auto";
+                    }
+                }
+            });
+
+            // ADVANCED ANTI-STALL BUFFER MONITOR:
+            // Detect repeated buffering. If we hit 3 seconds of continuous waiting, instantly force lowest possible quality bandwidth-wise (almost audio-only).
+            let stallTimer;
+            nativeVideo.addEventListener('waiting', () => {
+                clearTimeout(stallTimer);
+                stallTimer = setTimeout(() => {
+                    console.warn("Buffer stalled for 3s. Instantly dropping quality to the lowest bitrate to preserve stream.");
+                    if (hls && hls.levels && hls.levels.length > 0) {
+                        // Find the lowest level based on bandwidth (most robust metric for weak networks)
+                        const lowestLevelIndex = hls.levels.reduce((minIdx, lvl, idx, arr) => {
+                            return (lvl.bandwidth < arr[minIdx].bandwidth) ? idx : minIdx;
+                        }, 0);
+                        
+                        if (hls.currentLevel !== lowestLevelIndex) {
+                            hls.currentLevel = lowestLevelIndex;
+                        }
+                    }
+                }, 3000);
+            });
+
+            nativeVideo.addEventListener('playing', () => {
+                clearTimeout(stallTimer); // Clear timer when playback resumes successfully
+            });
+
             // Safe, dynamic re-instantiation of Plyr on the freshly fetched DOM video element
             const freshVideo = document.getElementById('video-player');
             player = new Plyr(freshVideo, {
                 controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'settings', 'pip', 'fullscreen'],
                 settings: ['quality', 'speed'],
                 keyboard: { focused: true, global: true },
+                i18n: {
+                    qualityLabel: {
+                        0: 'Auto'
+                    }
+                },
                 ...plyrOptions
             });
             
@@ -1156,7 +1245,12 @@ function playStream(url) {
         player = new Plyr(nativeVideo, {
             controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'settings', 'pip', 'fullscreen'],
             settings: ['quality', 'speed'],
-            keyboard: { focused: true, global: true }
+            keyboard: { focused: true, global: true },
+            i18n: {
+                qualityLabel: {
+                    0: 'Auto'
+                }
+            }
         });
         player.play().catch(() => {});
     }
@@ -1206,7 +1300,7 @@ function renderSources() {
         const count = globalChannelsData.filter(ch => ch.source === src.name).length;
         item.className = "source-item flex items-start gap-3 p-3 rounded-xl";
         item.innerHTML = \`
-        <div class="w-10 h-10 rounded-full bg-[#2D5BE3] flex items-center justify-center text-white text-sm font-bold shrink-0 mt-1 shadow-inner">\${idx + 1}</div>
+        <div class="w-10 h-10 rounded-full bg-[#2D5BE3] flex items-center justify-center text-white text-sm font-bold shrink-0 mt-1 shadow-inner">\text{\${idx + 1}}</div>
         <div class="flex-1 min-w-0 flex flex-col gap-2">
             <div class="flex items-center gap-2">
                 <input class="src-name w-full bg-[#272733] rounded-xl px-4 py-3 text-sm text-white font-medium border border-transparent focus:border-gray-600 focus:outline-none" 
